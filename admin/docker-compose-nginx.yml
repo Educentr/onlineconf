@@ -1,6 +1,6 @@
 services:
   onlineconf-admin:
-    image: ghcr.io/nikolo/onlineconf-admin:03daa51
+    image: ghcr.io/educentr/onlineconf-admin:v3.6.6
     depends_on:
       onlineconf-database:
         condition: service_healthy
