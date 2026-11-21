@@ -1,0 +1,88 @@
+# onlineconf-admin image: ghcr.io/<owner>/<repo>-admin (ghcr.io/educentr/onlineconf-admin).
+#
+#   pull request touching admin/**   → build only, nothing is pushed
+#   push to master touching admin/** → :<sha7>
+#   tag vX.Y.Z                       → :vX.Y.Z and :latest, pointing at the
+#                                      :<sha7> image of the tagged commit
+#                                      (built here if master never built it)
+#   Actions → Run workflow           → :<sha7> of the chosen branch or tag
+#                                      (and :vX.Y.Z/:latest when it is a tag)
+#
+# Signs in with GITHUB_TOKEN: no personal token is involved.
+name: admin image
+
+on:
+  push:
+    branches: [master]
+    # Path filters are not evaluated for tag pushes: a tag always releases.
+    tags: ["v*"]
+    paths:
+      - "admin/**"
+      - ".github/workflows/admin.yml"
+  pull_request:
+    paths:
+      - "admin/**"
+      - ".github/workflows/admin.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: admin-${{ github.ref }}
+  # A newer master push supersedes an older build; a release is never cut short.
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+env:
+  COMPONENT: admin
+  CONTEXT: admin
+  TAG_PREFIX: ""
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the image name and tags
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}-${COMPONENT}" >> "$GITHUB_ENV"
+          echo "REVISION=$sha" >> "$GITHUB_ENV"
+          echo "SHA_TAG=${sha::7}" >> "$GITHUB_ENV"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "VERSION=${GITHUB_REF_NAME#"$TAG_PREFIX"}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the commit image (push unless a pull request)
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] &&
+             docker buildx imagetools inspect "$IMAGE:$SHA_TAG" >/dev/null 2>&1; then
+            echo "$IMAGE:$SHA_TAG already exists, not rebuilding"
+            exit 0
+          fi
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$REVISION" \
+            -t "$IMAGE:$SHA_TAG" "$CONTEXT"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            echo "pull request: built $IMAGE:$SHA_TAG, not pushed"
+            exit 0
+          fi
+          docker push "$IMAGE:$SHA_TAG"
+
+      - name: Release the version and latest tags
+        if: github.ref_type == 'tag'
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:latest" "$IMAGE:$SHA_TAG"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
