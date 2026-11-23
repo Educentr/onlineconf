@@ -1,4 +1,4 @@
-module github.com/Nikolo/onlineconf/onlineconf-updater/v3
+module github.com/Educentr/onlineconf/onlineconf-updater/v3
 
 go 1.18
 

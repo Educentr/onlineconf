@@ -16,8 +16,8 @@ yarn-error.log*
 
 # go
 vendor
-/updater/data
-/updater/onlineconf-updater
+/onlineconf-updater/data
+/onlineconf-updater/onlineconf-updater
 /admin/go/onlineconf-admin
 
 # misc

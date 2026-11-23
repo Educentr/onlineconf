@@ -1,5 +1,6 @@
 etc
 init.d
 SPECS
-go/onlineconf-updater
-go/vendor
+onlineconf-updater
+vendor
+data

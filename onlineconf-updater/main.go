@@ -8,7 +8,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/Nikolo/onlineconf/onlineconf-updater/v3/updater"
+	"github.com/Educentr/onlineconf/onlineconf-updater/v3/updater"
 )
 
 var configFile = flag.String("config", "/usr/local/etc/onlineconf.yaml", "config file")
