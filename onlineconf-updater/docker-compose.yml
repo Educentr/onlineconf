@@ -1,7 +1,7 @@
 version: "3"
 services:
   onlineconf-updater:
-    image: ghcr.io/educentr/onlineconf-updater:v3.6.5
+    image: ghcr.io/educentr/onlineconf-updater:v3.7.0
     volumes:
       - ./data:/usr/local/etc/onlineconf
     environment:

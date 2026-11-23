@@ -199,4 +199,4 @@ gh release create v3.6.7 --repo Educentr/onlineconf --title v3.6.7 --notes "…"
   compose оркестратора) переводит **INFRA-3**.
 - compose-файлы этого репозитория — локальный стенд и демо; версии в них
   закреплены (`ghcr.io/educentr/onlineconf-admin:v3.6.6`,
-  `ghcr.io/educentr/onlineconf-updater:v3.6.5`) и поднимаются шагом 7 релиза.
+  `ghcr.io/educentr/onlineconf-updater:v3.7.0`) и поднимаются шагом 7 релиза.
