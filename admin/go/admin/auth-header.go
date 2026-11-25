@@ -49,10 +49,11 @@ type headerAuthenticator struct {
 // of the membership with the groups header needs. It is an interface to make
 // the synchronization testable without a database.
 type userGroupStore interface {
-	SelectUserGroups(ctx context.Context, user string) ([]string, error)
+	SelectUserGroups(ctx context.Context, user string) ([]Group, error)
+	SelectGroupsByNames(ctx context.Context, names []string) ([]*Group, error)
 	CreateGroupIfNotExists(ctx context.Context, name string) (bool, error)
-	AddUserToGroupIfNotExists(ctx context.Context, group, user string) (bool, error)
-	DeleteUserFromGroup(ctx context.Context, group, user string) error
+	AddUserToGroupIDIfNotExists(ctx context.Context, groupID int, user string) (bool, error)
+	DeleteUserFromGroupID(ctx context.Context, groupID int, user string) error
 }
 
 func NewHeaderAuthenticator(config HeaderAuthenticatorConfig) *headerAuthenticator {
@@ -98,9 +99,15 @@ func (auth *headerAuthenticator) Authenticate(req *http.Request) (string, error)
 	return username, nil
 }
 
-// groupsFromRequest returns the raw value of the groups header and reports
-// whether the request carries it at all. Only the first occurrence of the
-// header is honoured.
+// groupsFromRequest returns the value of the groups header and reports whether
+// the request carries it at all.
+//
+// A header sent in several lines is joined with a comma: by RFC 9110 §5.3 such
+// lines are equivalent to a single line holding the values separated by commas,
+// and the groups are separated by commas anyway, so no group is lost if the
+// proxy sends a line per group. A single line, which is what nginx and
+// oauth2-proxy send, is taken as is, so the signature of the groups
+// (see signData) is calculated over the value of the header itself.
 func (auth *headerAuthenticator) groupsFromRequest(req *http.Request) (string, bool) {
 	if auth.config.GroupsHeader == "" {
 		return "", false
@@ -109,13 +116,7 @@ func (auth *headerAuthenticator) groupsFromRequest(req *http.Request) (string, b
 	if len(values) == 0 {
 		return "", false
 	}
-	if len(values) > 1 {
-		log.Ctx(req.Context()).Warn().
-			Str("header", auth.config.GroupsHeader).
-			Int("count", len(values)).
-			Msg("the request carries several groups headers, only the first one is used")
-	}
-	return values[0], true
+	return strings.Join(values, ","), true
 }
 
 // checkSign verifies the signature passed in the "<header>-Sign" header.
@@ -153,12 +154,13 @@ func (auth *headerAuthenticator) checkSign(req *http.Request, username, groups s
 //
 //	<username>\n<groups field>\n<remote ip><secret>
 //
-// where <groups field> is the raw value of the groups header prefixed with "+",
-// or just "-" if the request carries no groups header. The marker keeps the two
-// cases distinct: without it a request carrying an empty groups header ("drop
-// every group of the user") and a request carrying no groups header at all
-// ("keep the membership untouched") would have the same signature, and one
-// could be replaced by the other.
+// where <groups field> is the value of the groups header prefixed with "+" (its
+// lines joined with a comma if there are several of them, see
+// groupsFromRequest), or just "-" if the request carries no groups header. The
+// marker keeps the two cases distinct: without it a request carrying an empty
+// groups header ("drop every group of the user") and a request carrying no
+// groups header at all ("keep the membership untouched") would have the same
+// signature, and one could be replaced by the other.
 func (auth *headerAuthenticator) signData(username, groups string, groupsSent bool, remoteIP string) []byte {
 	var buf bytes.Buffer
 	buf.WriteString(username)
@@ -208,10 +210,13 @@ func (auth *headerAuthenticator) parseGroups(ctx context.Context, raw string) []
 			log.Ctx(ctx).Warn().Str("group", name).Msg("a group of the groups header is skipped: the name is too long")
 			continue
 		}
-		if seen[foldGroupName(name)] {
+		// The repetitions of the very same name are dropped here, the names
+		// that differ but address the same group are deduplicated by the
+		// database, see resolveGroups.
+		if seen[name] {
 			continue
 		}
-		seen[foldGroupName(name)] = true
+		seen[name] = true
 		groups = append(groups, name)
 	}
 	return groups
@@ -228,83 +233,139 @@ func (auth *headerAuthenticator) parseGroups(ctx context.Context, raw string) []
 // (my_config_tree_access and others) reading that table. The database is
 // written only when the membership differs from the header, not on every
 // request.
-func (auth *headerAuthenticator) syncUserGroups(ctx context.Context, user string, groups []string) error {
+//
+// The membership is compared by the ID of the group and not by its name: it is
+// the collation of my_config_group.Name that decides which names are the same
+// one, so the names of the header are resolved to the groups of the database
+// first (see Group and resolveGroups).
+func (auth *headerAuthenticator) syncUserGroups(ctx context.Context, user string, names []string) error {
+	wanted, err := auth.resolveGroups(ctx, names)
+	if err != nil {
+		return err
+	}
 	current, err := auth.groups.SelectUserGroups(ctx, user)
 	if err != nil {
 		return fmt.Errorf("select groups of the user: %w", err)
 	}
 
-	currentSet := make(map[string]bool, len(current))
+	currentIDs := make(map[int]bool, len(current))
 	for _, group := range current {
-		currentSet[foldGroupName(group)] = true
+		currentIDs[group.ID] = true
 	}
-	wanted := make(map[string]bool, len(groups))
-	for _, group := range groups {
-		wanted[foldGroupName(group)] = true
+	wantedIDs := make(map[int]bool, len(wanted))
+	for _, group := range wanted {
+		wantedIDs[group.ID] = true
 	}
 
-	for _, group := range groups {
-		if currentSet[foldGroupName(group)] {
+	for _, group := range wanted {
+		if currentIDs[group.ID] {
 			continue
 		}
-		created, err := auth.groups.CreateGroupIfNotExists(ctx, group)
+		added, err := auth.groups.AddUserToGroupIDIfNotExists(ctx, group.ID, user)
 		if err != nil {
-			return fmt.Errorf("create group %s: %w", group, err)
-		}
-		if created {
-			log.Ctx(ctx).Info().Str("group", group).Msg("a group of the groups header is created without rights")
-		}
-		added, err := auth.groups.AddUserToGroupIfNotExists(ctx, group, user)
-		if err != nil {
-			return fmt.Errorf("add the user to group %s: %w", group, err)
+			return fmt.Errorf("add the user to group %s: %w", group.Name, err)
 		}
 		if added {
-			log.Ctx(ctx).Info().Str("group", group).Str("user", user).Msg("the user is added to a group by the groups header")
+			log.Ctx(ctx).Info().Str("group", group.Name).Str("user", user).Msg("the user is added to a group by the groups header")
 		}
 	}
 
 	for _, group := range current {
-		if wanted[foldGroupName(group)] {
+		if wantedIDs[group.ID] {
 			continue
 		}
-		if err := auth.groups.DeleteUserFromGroup(ctx, group, user); err != nil {
-			return fmt.Errorf("delete the user from group %s: %w", group, err)
+		if err := auth.groups.DeleteUserFromGroupID(ctx, group.ID, user); err != nil {
+			return fmt.Errorf("delete the user from group %s: %w", group.Name, err)
 		}
-		log.Ctx(ctx).Info().Str("group", group).Str("user", user).Msg("the user is removed from a group by the groups header")
+		log.Ctx(ctx).Info().Str("group", group.Name).Str("user", user).Msg("the user is removed from a group by the groups header")
 	}
 
 	return nil
 }
 
-// foldGroupName returns the key the names of the groups are compared by.
+// resolveGroups returns the groups of the database the names taken from the
+// groups header address, creating the groups that do not exist yet without any
+// rights on the tree (the rights are still granted in the UI). The groups are
+// deduplicated: several names can address one and the same group.
 //
-// The names are compared case-insensitively, because the unique key of
-// my_config_group.Name is case-insensitive as well: the group Root cannot be
-// created next to the group root, and both the API and the UI address the
-// existing one by either name. Comparing the names exactly would make every
-// request of a user whose Keycloak group differs from the group of the database
-// in case only remove it from the group and add it back.
-func foldGroupName(name string) string {
-	return strings.ToLower(name)
+// The names are resolved by the database, because the comparison of the names
+// belongs to it: the collation of my_config_group.Name ignores the case and the
+// accents, so the name /onlineconf/cafe of the header addresses the group café
+// of the database, and reproducing that in Go is not possible. Comparing the
+// names in Go made every request of such a user remove it from the group and
+// add it back, flapping its access.
+func (auth *headerAuthenticator) resolveGroups(ctx context.Context, names []string) ([]Group, error) {
+	resolved, err := auth.groups.SelectGroupsByNames(ctx, names)
+	if err != nil {
+		return nil, fmt.Errorf("select the groups of the groups header: %w", err)
+	}
+
+	missing := false
+	for _, group := range resolved {
+		if group == nil {
+			missing = true
+			break
+		}
+	}
+	if missing {
+		for i, group := range resolved {
+			if group != nil {
+				continue
+			}
+			created, err := auth.groups.CreateGroupIfNotExists(ctx, names[i])
+			if err != nil {
+				return nil, fmt.Errorf("create group %s: %w", names[i], err)
+			}
+			if created {
+				log.Ctx(ctx).Info().Str("group", names[i]).Msg("a group of the groups header is created without rights")
+			}
+		}
+		// Resolve again to learn the IDs of the groups just created and of the
+		// groups a parallel request has created meanwhile.
+		resolved, err = auth.groups.SelectGroupsByNames(ctx, names)
+		if err != nil {
+			return nil, fmt.Errorf("select the groups of the groups header: %w", err)
+		}
+	}
+
+	groups := make([]Group, 0, len(resolved))
+	seen := make(map[int]bool, len(resolved))
+	for i, group := range resolved {
+		if group == nil {
+			// The group has been deleted between the two queries.
+			log.Ctx(ctx).Warn().Str("group", names[i]).Msg("a group of the groups header is skipped: it does not exist")
+			continue
+		}
+		if seen[group.ID] {
+			continue
+		}
+		seen[group.ID] = true
+		groups = append(groups, *group)
+	}
+	return groups, nil
 }
 
 // dbUserGroupStore is the userGroupStore backed by the database of OnlineConf.
 type dbUserGroupStore struct{}
 
-func (dbUserGroupStore) SelectUserGroups(ctx context.Context, user string) ([]string, error) {
+func (dbUserGroupStore) SelectUserGroups(ctx context.Context, user string) ([]Group, error) {
 	return SelectUserGroups(ctx, user)
+}
+
+func (dbUserGroupStore) SelectGroupsByNames(ctx context.Context, names []string) ([]*Group, error) {
+	return SelectGroupsByNames(ctx, names)
 }
 
 func (dbUserGroupStore) CreateGroupIfNotExists(ctx context.Context, name string) (bool, error) {
 	return CreateGroupIfNotExists(ctx, name)
 }
 
-func (dbUserGroupStore) AddUserToGroupIfNotExists(ctx context.Context, group, user string) (bool, error) {
-	return AddUserToGroupIfNotExists(ctx, group, user)
+func (dbUserGroupStore) AddUserToGroupIDIfNotExists(ctx context.Context, groupID int, user string) (bool, error) {
+	return AddUserToGroupIDIfNotExists(ctx, groupID, user)
 }
 
-func (dbUserGroupStore) DeleteUserFromGroup(ctx context.Context, group, user string) error {
-	return DeleteUserFromGroup(ctx, group, user)
+func (dbUserGroupStore) DeleteUserFromGroupID(ctx context.Context, groupID int, user string) error {
+	return DeleteUserFromGroupID(ctx, groupID, user)
 }
 
 func (auth *headerAuthenticator) SelectUsers(ctx context.Context, term string) ([]string, error) {

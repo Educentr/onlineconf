@@ -15,6 +15,13 @@ package admin
 //	docker exec -i oc-test-mysql mysql -uonlineconf -ponlineconf onlineconf < admin/etc/schema.sql
 //	ONLINECONF_TEST_MYSQL_DSN='onlineconf:onlineconf@tcp(127.0.0.1:13306)/onlineconf?charset=utf8mb4&collation=utf8mb4_general_ci' \
 //	    go test ./admin/ -run MySQL -v
+//
+// If the tests run in a container of their own, the published port is not
+// reachable from it. Put the database into the network of that container and
+// address it by its address in that network instead:
+//
+//	docker network connect <network of the container> oc-test-mysql
+//	docker inspect -f '{{(index .NetworkSettings.Networks "<network>").IPAddress}}' oc-test-mysql
 
 import (
 	"context"
@@ -97,11 +104,22 @@ func authenticateWithGroups(t *testing.T, auth *headerAuthenticator, user, group
 	if username != user {
 		t.Fatalf("username = %q, want %q", username, user)
 	}
+	return selectUserGroupNames(t, user)
+}
+
+// selectUserGroupNames returns the names of the groups of the user read back
+// from the database.
+func selectUserGroupNames(t *testing.T, user string) []string {
+	t.Helper()
 	current, err := SelectUserGroups(context.Background(), user)
 	if err != nil {
 		t.Fatalf("SelectUserGroups: %v", err)
 	}
-	return current
+	names := make([]string, 0, len(current))
+	for _, group := range current {
+		names = append(names, group.Name)
+	}
+	return names
 }
 
 func selectGroupNames(t *testing.T) []string {
@@ -241,27 +259,85 @@ func TestMySQLSyncGroupsDrivesTreeAccess(t *testing.T) {
 	}
 }
 
-// TestMySQLSyncGroupsCaseInsensitiveName checks a group differing from the
-// group of the database in case only is not duplicated and does not make every
-// request rewrite the membership: the unique key of my_config_group.Name is
-// case-insensitive.
-func TestMySQLSyncGroupsCaseInsensitiveName(t *testing.T) {
-	openTestDatabase(t)
-	ctx := context.Background()
-	auth := newMySQLHeaderAuthenticator()
-
-	if err := CreateGroup(ctx, "root"); err != nil {
-		t.Fatalf("CreateGroup: %v", err)
+// countWrites returns the number of the statements modifying the data the
+// server has executed so far, so that a test can tell whether a request has
+// written anything at all. The database is a throwaway one used by the test
+// only, so the counters of the server are the counters of the test.
+func countWrites(t *testing.T) int {
+	t.Helper()
+	// INSERT ... SELECT, which the membership is created by, is counted as
+	// Com_insert_select and not as Com_insert.
+	rows, err := DB.Query(`
+		SHOW GLOBAL STATUS WHERE Variable_name IN (
+			'Com_insert', 'Com_insert_select', 'Com_replace', 'Com_replace_select',
+			'Com_update', 'Com_update_multi', 'Com_delete', 'Com_delete_multi'
+		)
+	`)
+	if err != nil {
+		t.Fatalf("read the status of the server: %v", err)
 	}
+	defer rows.Close()
 
-	for i := 0; i < 2; i++ {
-		groups := authenticateWithGroups(t, auth, "alice", "/onlineconf/Root")
-		if !reflect.DeepEqual(groups, []string{"root"}) {
-			t.Fatalf("groups of alice = %q, want [root]", groups)
+	writes := 0
+	for rows.Next() {
+		var name string
+		var count int
+		if err := rows.Scan(&name, &count); err != nil {
+			t.Fatalf("read the status of the server: %v", err)
 		}
-		if names := selectGroupNames(t); !reflect.DeepEqual(names, []string{"root"}) {
-			t.Fatalf("groups = %q, want [root]: the group must not be duplicated", names)
-		}
+		writes += count
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read the status of the server: %v", err)
+	}
+	return writes
+}
+
+// TestMySQLSyncGroupsNameOfTheSameGroup checks that a name of the header
+// differing from the name stored in the database, which still is the same name
+// for the database, neither duplicates the group nor rewrites the membership on
+// every request. The collation of my_config_group.Name (utf8mb4_0900_ai_ci)
+// ignores both the case and the accents, and only the database knows that.
+//
+// This is the regression test of the membership flapping: the names used to be
+// compared in Go by strings.ToLower, which told cafe and café apart, so every
+// request added alice to the group and removed her from it, leaving her without
+// the access to the tree on every second request.
+func TestMySQLSyncGroupsNameOfTheSameGroup(t *testing.T) {
+	for _, tc := range []struct{ name, stored, sent string }{
+		{name: "the case differs", stored: "root", sent: "Root"},
+		{name: "the accent is in the database only", stored: "café", sent: "cafe"},
+		{name: "the accent is in the header only", stored: "cafe", sent: "café"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			openTestDatabase(t)
+			ctx := context.Background()
+			auth := newMySQLHeaderAuthenticator()
+
+			if err := CreateGroup(ctx, tc.stored); err != nil {
+				t.Fatalf("CreateGroup: %v", err)
+			}
+			if err := AddUserToGroup(ctx, tc.stored, "alice"); err != nil {
+				t.Fatalf("AddUserToGroup: %v", err)
+			}
+
+			var writesBefore int
+			for i := 0; i < 4; i++ {
+				if i == 1 {
+					writesBefore = countWrites(t)
+				}
+				groups := authenticateWithGroups(t, auth, "alice", "/onlineconf/"+tc.sent)
+				if !reflect.DeepEqual(groups, []string{tc.stored}) {
+					t.Fatalf("groups of alice after the request %d = %q, want [%s]", i+1, groups, tc.stored)
+				}
+				if names := selectGroupNames(t); !reflect.DeepEqual(names, []string{tc.stored}) {
+					t.Fatalf("groups after the request %d = %q, want [%s]: the group must not be duplicated", i+1, names, tc.stored)
+				}
+			}
+			if writes := countWrites(t) - writesBefore; writes != 0 {
+				t.Errorf("the requests matching the membership have written the database %d times", writes)
+			}
+		})
 	}
 }
 
@@ -294,14 +370,30 @@ func TestMySQLSyncGroupsConcurrently(t *testing.T) {
 		}
 	}
 
-	groups, err := SelectUserGroups(context.Background(), "alice")
-	if err != nil {
-		t.Fatalf("SelectUserGroups: %v", err)
-	}
+	groups := selectUserGroupNames(t, "alice")
 	if !reflect.DeepEqual(groups, []string{"new-group", "root"}) {
 		t.Errorf("groups of alice = %q, want [new-group root]", groups)
 	}
 	if names := selectGroupNames(t); !reflect.DeepEqual(names, []string{"new-group", "root"}) {
 		t.Errorf("groups = %q, want [new-group root]", names)
+	}
+}
+
+// TestMySQLSyncGroupsTwoNamesOfOneGroup checks two names of the groups header
+// that are the same name for the database create a single group and a single
+// membership: the unique key of my_config_group.Name lets only one of them
+// exist, and the membership is compared by the ID of the group.
+func TestMySQLSyncGroupsTwoNamesOfOneGroup(t *testing.T) {
+	openTestDatabase(t)
+	auth := newMySQLHeaderAuthenticator()
+
+	for i := 0; i < 2; i++ {
+		groups := authenticateWithGroups(t, auth, "alice", "/onlineconf/cafe,/onlineconf/café")
+		if !reflect.DeepEqual(groups, []string{"cafe"}) {
+			t.Fatalf("groups of alice after the request %d = %q, want [cafe]", i+1, groups)
+		}
+		if names := selectGroupNames(t); !reflect.DeepEqual(names, []string{"cafe"}) {
+			t.Fatalf("groups after the request %d = %q, want [cafe]", i+1, names)
+		}
 	}
 }
