@@ -106,6 +106,29 @@ Right now two authentication methods are supported:
 
 * `header` - authentication is performed by a reverse proxy deployed in front of `onlineconf-admin`. In the header parameter you can specify the name of the HTTP header that the reverse proxy will use to pass the username (by default `X-Username`, for `oauth2-proxy`, for example, you should use `X-Forwarded-Preferred-Username`). If you specify a signature salt in the `secret` parameter, then `onlineconf-admin` in the HTTP header with the name `header + "-Sign"` (that is, `X-Username-Sign` by default) will expect a signature calculated as MD5 from the concatenation of the username, the user IP and the salt. When using a reverse proxy, you also need to set the `behind_reverse_proxy` configuration parameter in the http section to true.
 
+### Groups passed in a header
+
+The `header` method can also take the groups of a user from a header, so that the membership in the groups of OnlineConf is managed by the identity provider instead of the UI. `oauth2-proxy`, for example, passes the groups of the user in the `X-Forwarded-Groups` header separated by commas, as the full Keycloak paths (`/onlineconf/back-developer`, `/maintainers`).
+
+* `groups_header` - the name of the header the groups are passed in. If it is not set, nothing described in this section happens: the membership is managed in the UI only, as before.
+* `groups_prefix` - only the groups having this prefix are taken into account, and the prefix is cut off their names (`/onlineconf/back-developer` becomes `back-developer` with `groups_prefix: /onlineconf/`). The other groups of the header are ignored. If it is not set, the names are taken as is.
+
+In the Docker image these parameters are taken from the `ONLINECONF_AUTH_GROUPS_HEADER` and `ONLINECONF_AUTH_GROUPS_PREFIX` environment variables (and the salt of the signature from `ONLINECONF_AUTH_SECRET`), see [admin/docker-entrypoint.sh](admin/docker-entrypoint.sh).
+
+On every request carrying the groups header the membership of the user is brought in line with the header: the user is added to the groups listed in it and is removed from the groups it does not list. A group that does not exist yet is created without any rights on the tree: the rights of a group are still granted in the UI and are never taken from the header. The database is written only when the membership differs from the header, not on every request.
+
+All the groups are synchronized, `root` included, so the identity provider becomes the only source of the membership and the membership granted in the UI is overwritten by the next request of the user. Keep this in mind when turning the synchronization on:
+
+* create the groups in the identity provider first, at least the one mapped to `root`, and only then configure `groups_header`. Otherwise the very first request of every user takes it out of `root`;
+* a request carrying no groups header at all does not change the membership. This keeps working an emergency login bypassing the identity provider (a basic authentication of the reverse proxy, for example) and the clients having no such header, and this is the way to restore a lost access;
+* an empty groups header is not the same as a missing one: it takes the user out of every group;
+* the nested groups of the identity provider are not supported. A name still containing `/` after the prefix is cut off (`/onlineconf/back/senior`) is skipped with a warning in the log, because `/` breaks the routes of the API and of the UI; a name longer than 128 characters is skipped as well.
+
+If `secret` is set, the groups take part in the signature too, otherwise they could be forged. The signature is the MD5 of the following byte sequence:
+
+* without `groups_header` the historical format is used unchanged: `<username><user ip><secret>`;
+* with `groups_header`: `<username>\n<groups>\n<user ip><secret>`, where `\n` is the line feed (`0x0a`, a byte that cannot occur in a value of an HTTP header) and `<groups>` is the raw value of the groups header prefixed with `+`, or just `-` if the request carries no groups header. The `+`/`-` marker keeps a request carrying an empty groups header distinct from a request carrying no groups header, so that the one cannot be replaced by the other.
+
 ## Authorization
 
 Any parameter of the tree can be configured to be readable and writable by a specific group of users. Access rights are inherited by children parameters from the parent. Any user who can edit a parameter can delegate an access to another group of users.

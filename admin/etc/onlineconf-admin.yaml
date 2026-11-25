@@ -8,3 +8,19 @@ auth:
   password_field: user_passwd
   condition: "`user_group` = 'my'"
   realm: MY-admin
+
+# Authentication performed by a reverse proxy instead of the table above.
+# Requires behind_reverse_proxy: true in the http section.
+#auth:
+#  method: header
+#  # the header the username is passed in
+#  header: X-Forwarded-Preferred-Username
+#  # the salt of the signature of the headers, see README.md
+#  secret: xxx
+#  # the header the groups of the user are passed in, comma separated;
+#  # unset it to manage the membership in the UI only
+#  groups_header: X-Forwarded-Groups
+#  # only the groups having this prefix are taken into account,
+#  # the prefix is cut off their names
+#  groups_prefix: /onlineconf/
+#  realm: MY-admin
